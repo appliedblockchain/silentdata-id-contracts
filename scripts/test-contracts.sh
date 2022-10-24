@@ -1,0 +1,1 @@
+docker run --rm -v $PWD:/workspace silentdata-id/algorand-node bash -c "cd workspace && npm run test"

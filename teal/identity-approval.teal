@@ -1,0 +1,944 @@
+#pragma version 5
+// SILENTDATA ID stateful contract
+//
+// Converts a SILENTDATA proof certificate with yes/no answer (e.g. KYC check) into a fungible token
+// Will need to deploy a new version of this contract for each check configuration
+//
+// -- Operations:
+// create
+// - Args: enclave key (bytes), check hash (bytes)
+// - Transaction group: [create]
+// - Description: Creates the application and sets global configuration
+// setup
+// - Args: "setup"
+// - Transaction group: [pay pool, setup]
+// - Description: Creates identity token
+// set_key
+// - Args: "set_key", enclave key (bytes)
+// - Transaction group: [create]
+// - Description: Allows the admin to update the enclave signing key FIXME remove for prod
+// verify
+// - Args: "verify", signed data, signature
+// - Transaction group: [verify, 4 x fund]
+// - Description: Verifies a proof certificate and mints an identity token
+// fund
+// - Args: "fund"
+// - Transaction group: [verify, 4 x fund]
+// - Description: Dummy NoOp for pooling app call cost limits
+//
+// -- Global state:
+// enclave_key (bytes) = Public signing key of SGX enclave
+// check_hash (bytes) = Check configuration hash (identifies checks run in enclave)
+// id_asset_id (int) = ID of the SILENTDATA identity token
+//
+// -- Local state:
+// check_timestamp (int) = The time that the identity check was preformed
+//
+// -- Scratch space:
+// === Parsing helpers ===
+// 0: current_byte = Value of current byte (byte)
+// 1: byte_i = Current byte index (int)
+// 2: num_keys = Number of key-value pairs in map (int)
+// 3: key_length = Length of key string (int)
+// 4: current_key = Current key string (byte[])
+// 5: value_type = Value data type (byte)
+// 6: current_value = Current value data (int/byte[])
+// 7: value_info = Value further info (may be value, size, or number of bytes containing size) (byte)
+// 8: value_length = Length of value string (int)
+// === Certificate values ===
+// 10: Check hash
+// 11: Timestamp of proof
+// 12: Timestamp of Onfido check
+// 13: Identity unique ID
+// 14: Public key of proof owner
+//
+
+// Block DeleteApplication, CloseOut and UpdateApplication
+txn OnCompletion
+int DeleteApplication
+==
+bnz reject
+
+txn OnCompletion
+int CloseOut
+==
+bnz reject
+
+txn OnCompletion
+int UpdateApplication
+==
+bnz reject
+
+// Check if application is being created
+txn ApplicationID
+int 0
+==
+bnz creation
+
+// If no additional effects are required go to NoOp branch
+txn OnCompletion
+int NoOp
+==
+bnz no_op
+
+// Allow opt in
+txn OnCompletion
+int OptIn
+==
+bnz approve
+
+// Fail if we get here
+err
+
+// BRANCH creation START
+creation:
+  global GroupSize
+  int 1
+  ==
+  assert
+
+  txn NumAppArgs
+  int 2
+  ==
+  assert
+
+  byte "enclave_key"
+  txna ApplicationArgs 0
+  app_global_put
+
+  byte "check_hash"
+  txna ApplicationArgs 1
+  app_global_put
+
+  b approve
+// BRANCH creation END
+
+// BRANCH no_op START
+no_op:
+  txna ApplicationArgs 0
+  byte "setup"
+  ==
+  bnz setup
+
+  txna ApplicationArgs 0
+  byte "set_key"
+  ==
+  bnz set_key
+
+  txna ApplicationArgs 0
+  byte "verify"
+  ==
+  bnz verify
+
+  txna ApplicationArgs 0
+  byte "fund"
+  ==
+  bnz fund
+
+  // Error if invalid argument
+  err
+// BRANCH no_op END
+
+// BRANCH setup START
+setup:
+  // Only the admin can setup the contract
+  callsub check_admin
+
+  // Check contract hasn't already been set up
+  byte "id_asset_id"
+  app_global_get
+  int 0
+  ==
+  assert
+
+  // Setup should be grouped with payment transaction
+  global GroupSize
+  int 2
+  ==
+  assert
+
+  gtxn 0 TypeEnum
+  int pay // Payment
+  ==
+  assert
+
+  // Check contract is receiver of payment
+  gtxn 0 Receiver
+  global CurrentApplicationAddress
+  ==
+  assert
+
+  gtxn 0 CloseRemainderTo
+  global ZeroAddress
+  ==
+  assert
+
+  // Create identity token (SDID)
+  itxn_begin
+    int acfg
+    itxn_field TypeEnum
+    int 10000000000 // Large enough reserve to never run out
+    itxn_field ConfigAssetTotal
+    int 0 // Cannot have fraction of a token
+    itxn_field ConfigAssetDecimals
+    byte "SDID"
+    itxn_field ConfigAssetUnitName
+    byte "SILENTDATA-ID"
+    itxn_field ConfigAssetName
+    int 0 // Tokens can be transferred from this contract
+    itxn_field ConfigAssetDefaultFrozen
+    global CurrentApplicationAddress // All management addresses set to contract
+    dup
+    dup
+    dup
+    itxn_field ConfigAssetReserve
+    itxn_field ConfigAssetManager
+    itxn_field ConfigAssetFreeze
+    itxn_field ConfigAssetClawback
+  itxn_submit
+
+  byte "id_asset_id"
+  itxn CreatedAssetID
+  app_global_put
+
+  b approve
+// BRANCH setup END
+
+// BRANCH set_key START
+set_key:
+  callsub check_admin
+
+  global GroupSize
+  int 1
+  ==
+  assert
+
+  txn NumAppArgs
+  int 2
+  ==
+  assert
+
+  byte "enclave_key"
+  txna ApplicationArgs 1
+  app_global_put
+
+  b approve
+// BRANCH set_key END
+
+// BRANCH verify START
+verify:
+  txn NumAppArgs
+  int 3
+  ==
+  assert
+
+  txn NumAssets
+  int 1
+  ==
+  assert
+
+  txna ApplicationArgs 1 // signed data
+  txna ApplicationArgs 2 // signature
+  byte "enclave_key"
+  app_global_get
+  ed25519verify
+  int 1
+  ==
+  assert
+
+  // Put binary proof data on the stack
+  callsub parse_proof
+
+  // Check check hash matches global value
+  callsub get_check_hash
+  byte "check_hash"
+  app_global_get
+  ==
+  assert
+
+  // Check proof owner is transaction sender
+  callsub get_initiator_pkey
+  txn Sender
+  ==
+  assert
+
+  // Check sender doesn't already have a token
+  // If they don't, send them one
+  // If they do, update timestamp if appropriate
+  txn Sender
+  byte "id_asset_id"
+  app_global_get
+  asset_holding_get AssetBalance
+  assert // Fail if not opted in
+  int 0
+  ==
+  bnz transfer_id_token // Balance == 0
+
+  b update_check_timestamp
+// BRANCH verify END
+
+// BRANCH transfer_id_token START
+transfer_id_token:
+  // Send identity token to proof owner
+  itxn_begin
+    int axfer
+    itxn_field TypeEnum
+    byte "id_asset_id"
+    app_global_get
+    itxn_field XferAsset
+    txn Sender
+    itxn_field AssetReceiver
+    int 1
+    itxn_field AssetAmount
+    int 0
+    itxn_field Fee
+  itxn_submit  
+
+  // Freeze asset in proof owners account
+  itxn_begin
+    int afrz
+    itxn_field TypeEnum
+    byte "id_asset_id"
+    app_global_get
+    itxn_field FreezeAsset
+    txn Sender
+    itxn_field FreezeAssetAccount
+    int 1
+    itxn_field FreezeAssetFrozen
+    int 0
+    itxn_field Fee
+  itxn_submit
+
+  b update_check_timestamp
+// BRANCH transfer_id_token END
+
+// BRANCH update_check_timestamp START
+update_check_timestamp:
+  // Fail if the same timestamp already exists in local storage
+  // or if the new timestamp is less than the existing one
+  txn Sender
+  byte "check_timestamp"
+  app_local_get
+  callsub get_check_timestamp
+  <
+  assert
+
+  // Write check timestamp to local storage of proof owner
+  txn Sender
+  byte "check_timestamp"
+  callsub get_check_timestamp
+  app_local_put
+
+  b approve
+// BRANCH update_check_timestamp END
+
+// BRANCH fund START
+fund:
+  b approve
+// BRANCH fund END
+
+// BRANCH approve START
+approve:
+  int 1
+  return
+// BRANCH approve END
+
+// BRANCH reject START
+reject:
+  int 0
+  return
+// BRANCH reject END
+
+// ----- SUBROUTINES -----
+
+// SUBROUTINE check_admin START
+check_admin:
+  txn Sender
+  global CreatorAddress
+  ==
+  assert
+
+  retsub
+// SUBROUTINE check_admin END
+
+// ----- CBOR PARSING -----
+
+// SUBROUTINE parse_proof START
+parse_proof:
+  callsub parse_current_byte
+  callsub get_cbor_type
+  callsub check_map_type
+  assert                 // assert (type == map)
+
+  callsub get_cbor_info  // Number of key-value pairs in map
+  dup
+  btoi
+  callsub set_num_keys   // num_keys = uint(current_byte & 00011111)
+  callsub check_cbor_max_size
+  assert                 // assert (num_keys <= 23)
+
+  int 1
+  callsub set_byte_i     // byte_i = 1
+
+  callsub parse_cbor_map
+  retsub
+// SUBROUTINE parse_proof END
+
+// SUBROUTINE parse_cbor_map START
+parse_cbor_map:
+  // Check if all key-value pairs have been read
+  callsub get_num_keys
+  bz finish_parse // If no keys left to parse, finish
+
+  callsub parse_cbor_key
+  callsub parse_cbor_value
+  callsub save_values
+
+  // Decrement number of key-value pairs remaining
+  callsub get_num_keys
+  int 1
+  -
+  callsub set_num_keys
+
+  b parse_cbor_map // Loop
+// SUBROUTINE parse_cbor_map END
+
+// SUBROUTINE finish_parse START
+finish_parse:
+  retsub
+// SUBROUTINE finish_parse END
+  
+// SUBROUTINE parse_cbor_key START
+parse_cbor_key:
+  // First 3 bits of next byte should be 011 = 3 (text string), next 5 bits = number of characters in string = X
+  // Check type of key is a text string with length <= 23
+  callsub parse_current_byte
+  callsub get_cbor_type
+  callsub check_text_string_type
+  assert                 // assert (type_key == text_string)
+
+  callsub get_cbor_info  // Length of key string
+  dup
+  btoi
+  callsub set_key_length
+  callsub check_cbor_max_size
+  assert                 // assert (key_length <= 23)
+
+  // Increment current byte index
+  int 1
+  callsub increment_byte // byte_i ++
+
+  // Get the key string bytes
+  callsub get_key_length
+  callsub parse_n_bytes    // data[byte_i:byte_i+key_length]
+  callsub set_current_key
+
+  callsub get_key_length
+  callsub increment_byte // byte_i += key_length
+
+  retsub
+// SUBROUTINE parse_cbor_key END
+
+// SUBROUTINE parse_cbor_value START
+parse_cbor_value:
+  // Get first 3 bits of next byte for type (000 = unsigned int, 010 = byte string, 011 = text string)
+  // Get the value type and further information
+  callsub parse_current_byte
+  int 1
+  callsub increment_byte // byte_i ++
+
+  callsub get_cbor_type
+  callsub set_value_type
+  callsub get_cbor_info  // Length or further type
+  callsub set_value_info
+
+  // Check value type (byte and text strings are the same to TEAL)
+  callsub get_value_type
+  callsub check_int_type
+  bnz parse_cbor_int
+
+  callsub get_value_type
+  callsub check_byte_string_type
+  bnz parse_cbor_string
+
+  callsub get_value_type
+  callsub check_text_string_type
+  bnz parse_cbor_string
+
+  // Fail if value type is anything else
+  err
+// SUBROUTINE parse_cbor_value END
+
+// SUBROUTINE parse_cbor_int START
+parse_cbor_int:
+  // If unsigned int and byte <= 0x17, last 5 bits of current byte are the number
+  callsub get_value_info
+  callsub check_cbor_max_size // if (value_info <= 23) parse_cbor_small_uint
+  bnz parse_cbor_small_uint
+
+  // If unsigned int and byte == 0x18, next byte is the number
+  callsub get_value_info
+  callsub check_uint8_type
+  bnz parse_cbor_uint8
+
+  // If unsigned int and byte == 0x19, next 2 bytes are the number
+  callsub get_value_info
+  callsub check_uint16_type
+  bnz parse_cbor_uint16
+
+  // If unsigned int and byte == 0x1A, next 4 bytes are the number
+  callsub get_value_info
+  callsub check_uint32_type
+  bnz parse_cbor_uint32
+
+  // If unsigned int and byte == 0x1B, next 8 bytes are the number
+  callsub get_value_info
+  callsub check_uint64_type
+  bnz parse_cbor_uint64
+
+  // Fail if value info is anything else
+  err
+// SUBROUTINE parse_cbor_int END
+
+// SUBROUTINE parse_cbor_small_uint START
+parse_cbor_small_uint:
+  callsub get_value_info
+  btoi
+  callsub set_current_value
+
+  retsub
+// SUBROUTINE parse_cbor_small_uint END
+
+// SUBROUTINE parse_cbor_uint8 START
+parse_cbor_uint8:
+  int 1
+  callsub parse_n_bytes    // data[byte_i]
+  btoi
+  callsub set_current_value
+
+  int 1
+  callsub increment_byte // byte_i ++
+
+  retsub
+// SUBROUTINE parse_cbor_uint8 END
+
+// SUBROUTINE parse_cbor_uint16 START
+parse_cbor_uint16:
+  txna ApplicationArgs 1 // data
+  callsub get_byte_i
+  extract_uint16         // data[byte_i:byte_i+2]
+  callsub set_current_value
+
+  int 2
+  callsub increment_byte // byte_i += 2
+
+  retsub
+// SUBROUTINE parse_cbor_uint16 END
+
+// SUBROUTINE parse_cbor_uint32 START
+parse_cbor_uint32:
+  txna ApplicationArgs 1 // data
+  callsub get_byte_i
+  extract_uint32         // data[byte_i:byte_i+4]
+  callsub set_current_value
+
+  int 4
+  callsub increment_byte // byte_i += 4
+
+  retsub
+// SUBROUTINE parse_cbor_uint32 END
+
+// SUBROUTINE parse_cbor_uint64 START
+parse_cbor_uint64:
+  txna ApplicationArgs 1 // data
+  callsub get_byte_i
+  extract_uint64         // data[byte_i:byte_i+8]
+  callsub set_current_value
+
+  int 8
+  callsub increment_byte // byte_i += 8
+
+  retsub
+// SUBROUTINE parse_cbor_uint64 END
+
+// SUBROUTINE parse_cbor_string START
+parse_cbor_string:
+  callsub get_value_info
+  callsub check_cbor_max_size // if (value_info <= 23) parse_cbor_short_string
+  bnz parse_cbor_short_string
+
+  callsub get_value_info
+  callsub check_long_string_type
+  bnz parse_cbor_long_string
+
+  // Fail if string length longer than 1 byte
+  err
+// SUBROUTINE parse_cbor_string END
+
+// SUBROUTINE parse_cbor_short_string START
+parse_cbor_short_string:
+  callsub get_value_info
+  btoi
+  callsub parse_n_bytes    // data[byte_i:byte_i+int(value_info)]
+  callsub set_current_value
+
+  callsub get_value_info
+  btoi
+  callsub increment_byte // byte_i += int(value_info)
+
+  retsub
+// SUBROUTINE parse_cbor_short_string END
+
+// SUBROUTINE parse_cbor_long_string START
+parse_cbor_long_string:
+  int 1
+  callsub parse_n_bytes    // data[byte_i]
+  btoi
+  callsub set_value_length
+
+  int 1
+  callsub increment_byte // byte_i ++
+
+  callsub get_value_length
+  callsub parse_n_bytes    // data[byte_i:byte_i+value_length]
+  callsub set_current_value
+
+  callsub get_value_length
+  callsub increment_byte // byte_i += value_length
+
+  retsub
+// SUBROUTINE parse_cbor_long_string END
+
+// SUBROUTINE save_values START
+save_values:
+  callsub get_current_key
+  byte "check_hash"
+  ==
+  bnz save_check_hash
+
+  callsub get_current_key
+  byte "timestamp"
+  ==
+  bnz save_timestamp
+
+  callsub get_current_key
+  byte "check_timestamp"
+  ==
+  bnz save_check_timestamp
+
+  callsub get_current_key
+  byte "subject_id"
+  ==
+  bnz save_subject_id
+
+  callsub get_current_key
+  byte "initiator_pkey"
+  ==
+  bnz save_initiator_pkey
+
+  callsub get_current_key
+  byte "id"
+  ==
+  retsub
+
+  err
+// SUBROUTINE save_values END
+
+// SUBROUTINE save_check_hash START
+save_check_hash:
+  callsub get_current_value
+  store 10
+
+  retsub
+// SUBROUTINE save_check_hash END
+
+// SUBROUTINE save_timestamp START
+save_timestamp:
+  callsub get_current_value
+  store 11
+
+  retsub
+// SUBROUTINE save_timestamp END
+
+// SUBROUTINE save_check_timestamp START
+save_check_timestamp:
+  callsub get_current_value
+  store 12
+
+  retsub
+// SUBROUTINE save_check_timestamp END
+
+// SUBROUTINE save_subject_id START
+save_subject_id:
+  callsub get_current_value
+  store 13
+
+  retsub
+// SUBROUTINE save_subject_id END
+
+// SUBROUTINE save_initiator_pkey START
+save_initiator_pkey:
+  callsub get_current_value
+  store 14
+
+  retsub
+// SUBROUTINE save_initiator_pkey END
+
+// SUBROUTINE parse_current_byte START
+parse_current_byte:
+  txna ApplicationArgs 1 // data
+  callsub get_byte_i
+  int 1
+  extract3               // data[byte_i]
+  callsub set_current_byte
+
+  retsub
+// SUBROUTINE parse_current_byte END
+
+// SUBROUTINE parse_n_bytes START
+parse_n_bytes:
+  // n_bytes = number of bytes to get on top of stack
+  txna ApplicationArgs 1 // data
+  swap // data -> n_bytes
+  callsub get_byte_i
+  swap // data -> byte_i -> n_bytes
+  extract3               // data[byte_i:byte_i + n_bytes]
+
+  retsub
+// SUBROUTINE parse_n_bytes END
+
+// SUBROUTINE increment_byte START
+increment_byte:
+  // i = int on top of stack
+  callsub get_byte_i
+  +
+  callsub set_byte_i // byte_i += i
+
+  retsub
+// SUBROUTINE increment_byte END
+
+// SUBROUTINE get_cbor_type START
+get_cbor_type:
+  callsub get_current_byte
+  byte 0xe0              // 11100000
+  b&                     // Get first 3 bits (type key)
+
+  retsub
+// SUBROUTINE get_cbor_type_END
+
+// SUBROUTINE get_cbor_info START
+get_cbor_info:
+  callsub get_current_byte
+  byte 0x1f              // 00011111 
+  b&                     // Get last 5 bits (length or further type)
+
+  retsub
+// SUBROUTINE get_cbor_info_END
+
+// SUBROUTINE check_map_type START
+check_map_type:
+  byte 0xa0              // 10100000 (101 = map)
+  ==
+
+  retsub
+// SUBROUTINE check_map_type END
+
+// SUBROUTINE check_text_string_type START
+check_text_string_type:
+  byte 0x60              // 01100000 (011 = text string)
+  ==
+
+  retsub
+// SUBROUTINE check_text_string_type END
+
+// SUBROUTINE check_int_type START
+check_int_type:
+  byte 0x00              // Integer
+  ==
+
+  retsub
+// SUBROUTINE check_int_type END
+
+// SUBROUTINE check_uint8_type START
+check_uint8_type:
+  byte 0x18              // uint8
+  ==
+
+  retsub
+// SUBROUTINE check_uint8_type END
+
+// SUBROUTINE check_uint16_type START
+check_uint16_type:
+  byte 0x19              // uint16
+  ==
+
+  retsub
+// SUBROUTINE check_uint16_type END
+
+// SUBROUTINE check_uint32_type START
+check_uint32_type:
+  byte 0x1a              // uint32
+  ==
+
+  retsub
+// SUBROUTINE check_uint32_type END
+
+// SUBROUTINE check_uint64_type START
+check_uint64_type:
+  byte 0x1b              // uint64
+  ==
+
+  retsub
+// SUBROUTINE check_uint64_type END
+
+// SUBROUTINE check_byte_string_type START
+check_byte_string_type:
+  byte 0x40              // Byte string
+  ==
+
+  retsub
+// SUBROUTINE check_byte_string_type END
+
+// SUBROUTINE check_long_string_type START
+check_long_string_type:
+  byte 0x18              // Long string
+  ==
+
+  retsub
+// SUBROUTINE check_long_string_type END
+
+// SUBROUTINE check_cbor_max_size END
+check_cbor_max_size:
+  byte 0x17 // 00010111 = 23 (maximum length that fits into last 5 bits)
+  b<=
+
+  retsub
+// SUBROUTINE check_cbor_max_size END
+
+// ----- SCRATCH SPACE SETTERS AND GETTERS -----
+
+// SUBROUTINE set_current_byte START
+set_current_byte:
+  store 0
+  retsub
+// SUBROUTINE set_current_byte END
+
+// SUBROUTINE get_current_byte START
+get_current_byte:
+  load 0
+  retsub
+// SUBROUTINE get_current_byte END
+
+// SUBROUTINE set_byte_i START
+set_byte_i:
+  store 1
+  retsub
+// SUBROUTINE set_byte_i END
+
+// SUBROUTINE get_byte_i START
+get_byte_i:
+  load 1
+  retsub
+// SUBROUTINE get_byte_i END
+
+// SUBROUTINE set_num_keys START
+set_num_keys:
+  store 2
+  retsub
+// SUBROUTINE set_num_keys END
+
+// SUBROUTINE get_num_keys START
+get_num_keys:
+  load 2
+  retsub
+// SUBROUTINE get_num_keys END
+
+// SUBROUTINE set_key_length START
+set_key_length:
+  store 3
+  retsub
+// SUBROUTINE set_key_length END
+
+// SUBROUTINE get_key_length START
+get_key_length:
+  load 3
+  retsub
+// SUBROUTINE get_key_length END
+
+// SUBROUTINE set_current_key START
+set_current_key:
+  store 4
+  retsub
+// SUBROUTINE set_current_key END
+
+// SUBROUTINE get_current_key START
+get_current_key:
+  load 4
+  retsub
+// SUBROUTINE get_current_key END
+
+// SUBROUTINE set_value_type START
+set_value_type:
+  store 5
+  retsub
+// SUBROUTINE set_value_type END
+
+// SUBROUTINE get_value_type START
+get_value_type:
+  load 5
+  retsub
+// SUBROUTINE get_value_type END
+
+// SUBROUTINE set_current_value START
+set_current_value:
+  store 6
+  retsub
+// SUBROUTINE set_current_value END
+
+// SUBROUTINE get_current_value START
+get_current_value:
+  load 6
+  retsub
+// SUBROUTINE get_current_value END
+
+// SUBROUTINE set_value_info START
+set_value_info:
+  store 7
+  retsub
+// SUBROUTINE set_value_info END
+
+// SUBROUTINE get_value_info START
+get_value_info:
+  load 7
+  retsub
+// SUBROUTINE get_value_info END
+
+// SUBROUTINE set_value_length START
+set_value_length:
+  store 8
+  retsub
+// SUBROUTINE set_value_length END
+
+// SUBROUTINE get_value_length START
+get_value_length:
+  load 8
+  retsub
+// SUBROUTINE get_value_length END
+
+// SUBROUTINE get_check_hash START
+get_check_hash:
+  load 10
+  retsub
+// SUBROUTINE get_check_hash END
+
+// SUBROUTINE get_check_timestamp START
+get_check_timestamp:
+  load 12
+  retsub
+// SUBROUTINE get_check_timestamp END
+
+// SUBROUTINE get_initiator_pkey START
+get_initiator_pkey:
+  load 14
+  retsub
+// SUBROUTINE get_initiator_pkey END
