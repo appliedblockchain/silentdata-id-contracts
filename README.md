@@ -1,6 +1,16 @@
-# silentdata-id/contracts: Algorand smart contracts and supporting components
+# Silent Data ID Smart Contract
 
-This code has not been security auditied and should only be used as an example.
+**Note:** This code has not been security auditied and should only be used as an example.
+
+[Silent Data](https://silentdata.com) is a platform for proving properties of private web2 data in the form of signed proof certificates that can be consumed by smart contracts. Silent Data leverages Intel SGX enclaves in order to enable privacy-preserving retrieval and processing of off-chain data, and generation of cryptographic proofs that are verifiable in blockchain smart contracts. This ensures that sensitive information is never revealed, not even to those hosting the platform, and that the code used to retrieve the data and generate the proofs cannot be modified or interfered with by the operator.
+
+Silent Data ID is composed of a single stateful smart contract deployed on the Algorand blockchain. The accepted enclave signing public key and proof type are stored in the global storage of the contract at creation. Any user is able to read the public key and verify that it comes from a legitimate enclave. The contract maintains a reserve of unminted, fungible identity tokens that can only be distributed and transferred by the contract.
+
+After successfully completing the KYC proof process on Silent Data, the subject of the check will have access to the signed proof certificate. The subject can upload the proof data and signature contained in the certificate to the contract in a transaction signed by their wallet private key. The contract will verify the signature using the global public key and then parse the CBOR encoded data to extract the wallet address, proof type and the time of the check.
+
+The wallet address is compared with the sender of the transaction and the proof type is compared with the allowed value in global storage. If all of the verifications are successful the contract will transfer an identity token to the wallet of the subject. The token will be frozen so that the subject is not able to transfer the token to another wallet. The contract will also write the timestamp of the check into the local storage of the user so that other applications can access that information if they require the checks to have been completed within a certain time period. Other DeFi applications can now be convinced that the holders of these identity tokens have undergone KYC checks.
+
+![SILENTDATA whitepaper](https://user-images.githubusercontent.com/12896404/197566689-51a1d4f9-569e-46cf-a7e7-3e0ec3a96fbe.png)
 
 ## Setup
 
